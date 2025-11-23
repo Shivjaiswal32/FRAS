@@ -9,7 +9,7 @@ warnings.filterwarnings('ignore')
 import datetime
 import time
 import tkinter as tk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk  
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
@@ -440,40 +440,151 @@ def check_attendance():
 
     conn = sqlite3.connect('studentss.db')
     c = conn.cursor()
+
+    # Get student info (include image_folder to infer registration date)
+    c.execute("SELECT name, department, image_folder FROM students WHERE roll_number = ?", (roll_number,))
+    student = c.fetchone()
+    if not student:
+        conn.close()
+        messagebox.showinfo("Not Found", f"No student found with Roll Number {roll_number}.")
+        return
+
+    student_name, student_dept, image_folder = student
+
+    # We'll generate an Excel report starting from the student's registration date
+    from datetime import datetime, timedelta
+
+    total_days = 100
+    today = datetime.now().date()
+
+    # Determine registration date from image folder (earliest image creation time) if available
+    registration_date = None
+    try:
+        if image_folder and os.path.exists(image_folder):
+            timestamps = []
+            for fname in os.listdir(image_folder):
+                fpath = os.path.join(image_folder, fname)
+                if os.path.isfile(fpath):
+                    try:
+                        timestamps.append(os.path.getctime(fpath))
+                    except Exception:
+                        pass
+
+            if timestamps:
+                earliest = min(timestamps)
+                registration_date = datetime.fromtimestamp(earliest).date()
+            else:
+                # If no image files, fallback to folder creation time
+                try:
+                    registration_date = datetime.fromtimestamp(os.path.getctime(image_folder)).date()
+                except Exception:
+                    registration_date = None
+    except Exception:
+        registration_date = None
+
+    # If we couldn't determine registration date, fall back to showing the last `total_days`
+    if not registration_date:
+        registration_date = today - timedelta(days=total_days-1)
+
+    # Build date list from latest (today) back to the registration date, limiting to `total_days`
+    days_span = (today - registration_date).days
+    if days_span < 0:
+        days_span = 0
+    num_days = min(days_span + 1, total_days)
+    date_list = [(today - timedelta(days=i)) for i in range(0, num_days)]
+
+    # Local import for openpyxl
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment
+        from openpyxl.utils import get_column_letter
+    except Exception:
+        messagebox.showerror("Missing Dependency", "The package 'openpyxl' is required to export Excel reports.\nPlease run: pip install openpyxl")
+        conn.close()
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Attendance_{roll_number}"
+
+    # Header
+    headers = ["Date", "Day", "Login Time", "Logout Time", "Duration", "Status"]
+    ws.append(["Student Name:", student_name, "Roll Number:", roll_number, "Department:", student_dept])
+    ws.append([])
+    ws.append(headers)
+    for col_idx, _ in enumerate(headers, start=1):
+        cell = ws.cell(row=3, column=col_idx)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center')
+
+    any_records = False
+
+    for d in date_list:
+        date_str = d.strftime("%Y-%m-%d")
+        # Fetch records for this date (match date prefix)
+        # Order daily records by login_time descending so the latest attendance for the date appears first
+        c.execute("SELECT login_time, logout_time FROM attendance WHERE roll_number = ? AND substr(login_time,1,10) = ? ORDER BY login_time DESC", (roll_number, date_str))
+        rows = c.fetchall()
+
+        if not rows:
+            # Absent for this date
+            ws.append([date_str, d.strftime("%A"), "", "", "", "No Login (Absent)"])
+        else:
+            any_records = True
+            for login_time_str, logout_time_str in rows:
+                try:
+                    login_dt = datetime.strptime(login_time_str, "%Y-%m-%d %H:%M:%S")
+                    login_display = login_dt.strftime("%I:%M %p")
+                except Exception:
+                    login_display = login_time_str
+
+                if logout_time_str:
+                    try:
+                        logout_dt = datetime.strptime(logout_time_str, "%Y-%m-%d %H:%M:%S")
+                        logout_display = logout_dt.strftime("%I:%M %p")
+                        duration_delta = logout_dt - login_dt
+                        total_minutes = int(duration_delta.total_seconds() / 60)
+                        if total_minutes < 60:
+                            duration_str = f"{total_minutes} min"
+                        else:
+                            hours = total_minutes // 60
+                            minutes = total_minutes % 60
+                            duration_str = f"{hours}h {minutes}m"
+                        status = "Present"
+                    except Exception:
+                        logout_display = logout_time_str
+                        duration_str = "N/A"
+                        status = "Present"
+                else:
+                    logout_display = ""
+                    duration_str = ""
+                    status = "Logged In (No Logout)"
+
+                ws.append([date_str, d.strftime("%A"), login_display, logout_display, duration_str, status])
+
+    # Auto-fit columns (approximate)
+    for column_cells in ws.columns:
+        length = max((len(str(cell.value)) if cell.value is not None else 0) for cell in column_cells)
+        column_letter = get_column_letter(column_cells[0].column)
+        ws.column_dimensions[column_letter].width = min(max(length + 2, 10), 50)
+
+    # Save file to Downloads folder
+    downloads_path = os.path.expanduser("~\\Downloads")
+    if not os.path.exists(downloads_path):
+        os.makedirs(downloads_path)
     
-    # Query to fetch all attendance records for the specified roll number
-    c.execute("SELECT login_time, logout_time FROM attendance WHERE roll_number = ?", (roll_number,))
-    attendance_records = c.fetchall()
-
-    # Count total attendance and group by date
-    total_attendance = len(attendance_records)
-    date_records = {}
-
-    for record in attendance_records:
-        login_time, logout_time = record
-        date = login_time.split(" ")[0]  # Get only the date part
-        
-        if date not in date_records:
-            date_records[date] = []
-        date_records[date].append((login_time, logout_time))
-
+    # Sanitize student name and save file to Downloads using student name
+    safe_name = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in student_name).strip().replace(' ', '_')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_file = os.path.join(downloads_path, f"{safe_name}_{timestamp}.xlsx")
+    wb.save(excel_file)
     conn.close()
 
-    # Calculate attendance percentage out of 100 days
-    total_days = 100  # Assuming we're tracking attendance over 100 days
-    attendance_percentage = (total_attendance / total_days) * 100
-
-    # Prepare the attendance summary message
-    if total_attendance > 0:
-        attendance_info = f"Total Attendance: {total_attendance} out of {total_days} days ({attendance_percentage:.2f}%)\n\n"
-        for date, records in date_records.items():
-            attendance_info += f"{date}:\n"
-            for login_time, logout_time in records:
-                attendance_info += f"  Login: {login_time}  Logout: {logout_time if logout_time else 'N/A'}\n"
-        messagebox.showinfo("Attendance Records", f"Attendance for Roll Number {roll_number}:\n\n{attendance_info}")
-    else:
-
-        messagebox.showinfo("No Records", "No attendance records found for this Roll Number.")
+    messagebox.showinfo("Attendance Exported", f"Excel attendance report generated:\n{excel_file}")
+    try:
+        os.startfile(excel_file)
+    except Exception:
+        pass
 
 def generate_student_info_pdf():
     conn = sqlite3.connect('studentss.db')
@@ -483,7 +594,7 @@ def generate_student_info_pdf():
     c.execute("SELECT name, department, roll_number FROM students")
     students = c.fetchall()
     
-    # Create a PDF document
+    # Create a pdf document
     pdf_file = "attendance_report.pdf"
     document = SimpleDocTemplate(pdf_file, pagesize=letter)
     elements = []
@@ -653,14 +764,20 @@ def generate_student_info_pdf():
     
     conn.close()
     
-    # Build the PDF
+    # Build the pdf and save to Downloads folder
+    downloads_path = os.path.expanduser("~\\Downloads")
+    if not os.path.exists(downloads_path):
+        os.makedirs(downloads_path)
+    
+    pdf_file = os.path.join(downloads_path, "attendance_report.pdf")
+    document = SimpleDocTemplate(pdf_file, pagesize=letter)
     document.build(elements)
     
     messagebox.showinfo(
         "📊 Attendance Report Generated!",
         f"✅ Detailed attendance report has been successfully generated!\n\n"
         f"📄 File Name: attendance_report.pdf\n"
-        f"📁 Location: {os.path.abspath(pdf_file)}\n\n"
+        f"📁 Location: {pdf_file}\n\n"
         f"📋 Report includes:\n"
         f"• Date and day for each attendance\n"
         f"• Complete login/logout times\n"
@@ -669,7 +786,204 @@ def generate_student_info_pdf():
         f"🚀 Opening report now..."
     )
     os.startfile(pdf_file)
+
+
+def generate_student_info_excel():
+    """
+    Generate an Excel attendance report (attendance_report.xlsx).
+    """
+    conn = sqlite3.connect('studentss.db')
+    c = conn.cursor()
+
+    c.execute("SELECT name, department, roll_number FROM students")
+    students = c.fetchall()
+
+    # Local import so project runs without openpyxl installed until user adds it
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment
+        from openpyxl.utils import get_column_letter
+    except Exception as e:
+        messagebox.showerror("Missing Dependency", "The package 'openpyxl' is required to export Excel reports.\nPlease run: pip install openpyxl")
+        conn.close()
+        return
+
+    from datetime import datetime
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Attendance Report"
+
+    headers = ["Name", "Roll Number", "Department", "Date", "Day", "Login Time", "Logout Time", "Duration"]
+    ws.append(headers)
+    for col_idx, _ in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center')
+
+    for student in students:
+        name, department, roll_number = student
+        c.execute("SELECT login_time, logout_time FROM attendance WHERE roll_number = ? ORDER BY login_time DESC", (roll_number,))
+        attendance_records = c.fetchall()
+
+        if attendance_records:
+            for login_time_str, logout_time_str in attendance_records:
+                try:
+                    login_dt = datetime.strptime(login_time_str, "%Y-%m-%d %H:%M:%S")
+                    date_str = login_dt.strftime("%b %d, %Y")
+                    day_str = login_dt.strftime("%A")
+                    login_display = login_dt.strftime("%I:%M %p")
+                except Exception:
+                    date_str = login_time_str
+                    day_str = ""
+                    login_display = login_time_str
+
+                if logout_time_str:
+                    try:
+                        logout_dt = datetime.strptime(logout_time_str, "%Y-%m-%d %H:%M:%S")
+                        logout_display = logout_dt.strftime("%I:%M %p")
+                        duration_delta = logout_dt - login_dt
+                        total_minutes = int(duration_delta.total_seconds() / 60)
+                        if total_minutes < 60:
+                            duration_str = f"{total_minutes} min"
+                        else:
+                            hours = total_minutes // 60
+                            minutes = total_minutes % 60
+                            duration_str = f"{hours}h {minutes}m"
+                    except Exception:
+                        logout_display = logout_time_str
+                        duration_str = "N/A"
+                else:
+                    logout_display = "Not logged out"
+                    duration_str = "N/A"
+
+                ws.append([name, roll_number, department, date_str, day_str, login_display, logout_display, duration_str])
+        else:
+            ws.append([name, roll_number, department, "No Records", "", "", "", ""]) 
+
+    # Adjust column widths
+    for column_cells in ws.columns:
+        length = max((len(str(cell.value)) if cell.value is not None else 0) for cell in column_cells)
+        column_letter = get_column_letter(column_cells[0].column)
+        ws.column_dimensions[column_letter].width = min(max(length + 2, 10), 50)
+
+    # Save file to Downloads folder
+    downloads_path = os.path.expanduser("~\\Downloads")
+    if not os.path.exists(downloads_path):
+        os.makedirs(downloads_path)
     
+    excel_file = os.path.join(downloads_path, "attendance_report.xlsx")
+    wb.save(excel_file)
+    conn.close()
+
+    messagebox.showinfo("📊 Attendance Report Generated!", f"Excel report saved as: {excel_file}")
+    try:
+        os.startfile(excel_file)
+    except Exception:
+        pass
+
+
+def generate_reports(root=None):
+    """Generate both PDF and Excel reports. Keeps existing PDF behavior and also creates an Excel file."""
+    try:
+        generate_student_info_pdf()
+    except Exception as e:
+        # If PDF generation fails, show an error but still attempt Excel
+        print(f"PDF generation failed: {e}")
+        messagebox.showerror("PDF Error", f"Failed to generate PDF: {e}")
+
+    try:
+        generate_student_info_excel()
+    except Exception as e:
+        print(f"Excel generation failed: {e}")
+        messagebox.showerror("Excel Error", f"Failed to generate Excel: {e}")
+
+
+def show_export_options(root=None):
+    """Show a small modal dialog offering PDF / Excel / Both export options."""
+    dialog = tk.Toplevel(root) if root else tk.Toplevel()
+    dialog.title("Export Options")
+    dialog.geometry("360x140")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+    dialog.grab_set()
+
+    lbl = tk.Label(dialog, text="Choose export format:", font=("Arial", 12))
+    lbl.pack(pady=(12, 6))
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(pady=(6, 12))
+
+    def do_pdf():
+        dialog.destroy()
+        try:
+            generate_student_info_pdf()
+        except Exception as e:
+            messagebox.showerror("PDF Error", f"Failed to generate PDF: {e}")
+
+    def do_excel():
+        dialog.destroy()
+        try:
+            generate_student_info_excel()
+        except Exception as e:
+            messagebox.showerror("Excel Error", f"Failed to generate Excel: {e}")
+
+    def do_both():
+        dialog.destroy()
+        try:
+            generate_reports(root)
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to generate reports: {e}")
+
+    pdf_btn = tk.Button(btn_frame, text="PDF", width=10, command=do_pdf, bg="#0073e6", fg="white")
+    pdf_btn.grid(row=0, column=0, padx=6)
+
+    excel_btn = tk.Button(btn_frame, text="Excel", width=10, command=do_excel, bg="#0073e6", fg="white")
+    excel_btn.grid(row=0, column=1, padx=6)
+
+    both_btn = tk.Button(btn_frame, text="Both", width=10, command=do_both, bg="#0073e6", fg="white")
+    both_btn.grid(row=0, column=2, padx=6)
+
+    cancel_btn = tk.Button(dialog, text="Cancel", command=dialog.destroy)
+    cancel_btn.pack(pady=(0, 8))
+    
+
+def animate_gif(label, gif_frames, frame_index, delay=100):
+    """Animate GIF by cycling through frames."""
+    if gif_frames:
+        frame = gif_frames[frame_index[0] % len(gif_frames)]
+        label.config(image=frame)
+        frame_index[0] = (frame_index[0] + 1) % len(gif_frames)
+        label.after(delay, animate_gif, label, gif_frames, frame_index, delay)
+
+
+def load_animated_gif(gif_path, resize_to=(1500, 1000)):
+    """Load all frames from a GIF file."""
+    try:
+        gif = Image.open(gif_path)
+        frames = []
+        durations = []
+        
+        try:
+            while True:
+                frame = gif.copy()
+                frame = frame.resize(resize_to, Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(frame)
+                frames.append(photo)
+                
+                # Get frame duration (default 100ms if not specified)
+                duration = gif.info.get('duration', 100)
+                durations.append(duration)
+                
+                gif.seek(gif.tell() + 1)
+        except EOFError:
+            pass
+        
+        return frames if frames else None, durations if durations else [100]
+    except Exception as e:
+        print(f"Error loading GIF: {e}")
+        return None, [100]
+
 
 def main():
     # Initialize database first
@@ -682,18 +996,29 @@ def main():
    
 
     
-    # Load the background image
-    try:
-        bg_image = Image.open("assets/background.jpg")  # Updated path to assets folder
-        bg_image = bg_image.resize((1500, 1000), Image.Resampling.LANCZOS)  # Resize to fit the window
-        bg_photo = ImageTk.PhotoImage(bg_image)
-    except FileNotFoundError:
-        print("Error: Background image file not found.")
-        return
+    # Load the animated background GIF
+    gif_frames, durations = load_animated_gif("assets/background.gif", resize_to=(1500, 1000))
+    
+    if gif_frames:
+        bg_label = tk.Label(root)
+        bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+        frame_index = [0]
+        animate_gif(bg_label, gif_frames, frame_index, delay=durations[0] if durations else 100)
+    else:
+        # Fallback to JPG if GIF fails
+        try:
+            bg_image = Image.open("assets/background.jpg")
+            bg_image = bg_image.resize((1500, 1000), Image.Resampling.LANCZOS)
+            bg_photo = ImageTk.PhotoImage(bg_image)
+            bg_label = tk.Label(root, image=bg_photo)
+            bg_label.image = bg_photo
+            bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+        except FileNotFoundError:
+            print("Error: Background image file not found.")
+            return
 
     # Create a Label widget to display the background image
-    bg_label = tk.Label(root, image=bg_photo)
-    bg_label.place(x=0, y=0, relwidth=1, relheight=1)  # Cover the entire window
+    # (Already created above in the GIF animation section)
 
     # Add a text label on top of the background image
     title_label = tk.Label(
@@ -705,7 +1030,7 @@ def main():
         padx=10,
         pady=15
     )
-    title_label.place(x=400, y=80)  # Position it at the top center
+    title_label.place(relx=0.5, y=120, anchor="center")  # Center horizontally, moved down
 
 
     # Load the image for the buttons    
@@ -714,11 +1039,11 @@ def main():
         img = img.resize((220, 220), Image.Resampling.LANCZOS)
         photo_img = ImageTk.PhotoImage(img)
 
-        img_student = Image.open("assets/face-recognition-System-scaled-1.png") 
+        img_student = Image.open("assets/face-recognition-System-scaled.png") 
         img_student = img_student.resize((220, 220), Image.Resampling.LANCZOS)
         photo_img1 = ImageTk.PhotoImage(img_student)
         
-        img_student1 = Image.open("assets/attendanceimg.png")  
+        img_student1 = Image.open("assets/CheckAttendance.png")  
         img_student1 = img_student1.resize((220, 220), Image.Resampling.LANCZOS)
         photo_img2 = ImageTk.PhotoImage(img_student1)
 
@@ -780,10 +1105,10 @@ def main():
     export_frame = tk.Frame(root, bg="#cce6ff", bd=5, relief="ridge")
     export_frame.place(x=900, y=300, width=250, height=300)
 
-    export_button = tk.Button(export_frame, image=photo_ex, cursor="hand2", borderwidth=0, command=generate_student_info_pdf)
+    export_button = tk.Button(export_frame, image=photo_ex, cursor="hand2", borderwidth=0, command=lambda: show_export_options(root))
     export_button.place(x=10, y=10, width=220, height=220)
 
-    export_label = tk.Button(export_frame, text="Export Attendance", font=("Arial", 14), command=generate_student_info_pdf, 
+    export_label = tk.Button(export_frame, text="Export Attendance", font=("Arial", 14), command=lambda: show_export_options(root), 
                          cursor="hand2", bg="#0073e6", fg="white", relief="raised")
     export_label.place(x=10, y=240, width=220, height=40)
 
